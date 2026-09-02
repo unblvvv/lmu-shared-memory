@@ -1,3 +1,48 @@
+//! # lmu-shared-memory
+//!
+//! Safe Rust interface for reading telemetry and standings
+//! from Le Mans Ultimate shared memory.
+//!
+//! ## Platform support
+//!
+//! This crate currently supports Windows only.
+//!
+//! ## Telemetry
+//!
+//! ```no_run
+//! use lmu_shared_memory::{LmuTelemetry, TelemetryUpdate};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut telemetry = LmuTelemetry::connect()?;
+//!
+//! if let TelemetryUpdate::Snapshot(snapshot) = telemetry.read()? {
+//!     println!("Throttle: {}", snapshot.pedals.throttle);
+//! }
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! ## Standings
+//!
+//! ```no_run
+//! use lmu_shared_memory::{LmuStandings, StandingsUpdate};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut standings = LmuStandings::connect()?;
+//!
+//! if let StandingsUpdate::Snapshot(snapshot) = standings.read()? {
+//!     for entry in snapshot.entries {
+//!         println!(
+//!             "{}: {}",
+//!             entry.position,
+//!             entry.driver_name
+//!         );
+//!     }
+//! }
+//! # Ok(())
+//! # }
+//! ```
+
 use std::{cmp::Ordering, collections::HashMap};
 
 mod shared_memory;
