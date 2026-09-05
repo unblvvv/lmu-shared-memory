@@ -1,49 +1,4 @@
-//! # lmu-shared-memory
-//!
-//! Safe Rust interface for reading telemetry and standings
-//! from Le Mans Ultimate shared memory.
-//!
-//! ## Platform support
-//!
-//! This crate currently supports Windows only.
-//!
-//! ## Telemetry
-//!
-//! ```no_run
-//! use lmu_shared_memory::{LmuTelemetry, TelemetryUpdate};
-//!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut telemetry = LmuTelemetry::connect()?;
-//!
-//! if let TelemetryUpdate::Snapshot(snapshot) = telemetry.read()? {
-//!     println!("Throttle: {}", snapshot.pedals.throttle);
-//! }
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! ## Standings
-//!
-//! ```no_run
-//! use lmu_shared_memory::{LmuStandings, StandingsUpdate};
-//!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let mut standings = LmuStandings::connect()?;
-//!
-//! if let StandingsUpdate::Snapshot(snapshot) = standings.read()? {
-//!     for entry in snapshot.entries {
-//!         println!(
-//!             "{}: {}",
-//!             entry.position,
-//!             entry.driver_name
-//!         );
-//!     }
-//! }
-//! # Ok(())
-//! # }
-//! ```
-
-use std::{cmp::Ordering, collections::HashMap};
+use std::{cmp::Ordering, collections::HashMap, mem::size_of};
 
 mod shared_memory;
 
@@ -66,6 +21,14 @@ const SCORING_SESSION: usize = SCORING_INFO + 64;
 const SCORING_CURRENT_ET: usize = SCORING_INFO + 68;
 const SCORING_NUM_VEHICLES: usize = SCORING_INFO + 104;
 const SCORING_PLAYER_NAME: usize = SCORING_INFO + 116;
+const SCORING_CLOUD_DARKNESS: usize = SCORING_INFO + 212;
+const SCORING_RAIN_INTENSITY: usize = SCORING_INFO + 220;
+const SCORING_AMBIENT_TEMPERATURE: usize = SCORING_INFO + 228;
+const SCORING_TRACK_TEMPERATURE: usize = SCORING_INFO + 236;
+const SCORING_WIND: usize = SCORING_INFO + 244;
+const SCORING_MIN_PATH_WETNESS: usize = SCORING_INFO + 268;
+const SCORING_MAX_PATH_WETNESS: usize = SCORING_INFO + 276;
+const SCORING_AVERAGE_PATH_WETNESS: usize = SCORING_INFO + 332;
 const VEHICLE_SCORING: usize = 2_192;
 const VEHICLE_SCORING_SIZE: usize = 584;
 const ACTIVE_TELEMETRY_VEHICLES: usize = 128_464;
@@ -75,6 +38,7 @@ const VEHICLE_TELEMETRY: usize = 128_468;
 const VEHICLE_TELEMETRY_SIZE: usize = 1_888;
 
 const _: () = assert!(VEHICLE_TELEMETRY + VEHICLE_TELEMETRY_SIZE * MAX_VEHICLES == MAPPING_SIZE);
+const _: () = assert!(SCORING_AVERAGE_PATH_WETNESS + size_of::<f64>() <= VEHICLE_SCORING);
 
 #[derive(Debug)]
 pub enum Error {
@@ -284,6 +248,134 @@ fn normalize_input(value: f64) -> f32 {
     } else {
         0.
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Wind {
+    /// Wind velocity along LMU's world X axis, in meters per second.
+    pub x: f64,
+    /// Wind velocity along LMU's world Y axis, in meters per second.
+    pub y: f64,
+    /// Wind velocity along LMU's world Z axis, in meters per second.
+    pub z: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct WeatherSnapshot {
+    /// Cloud darkness, from 0.0 (clear) to 1.0 (dark).
+    pub cloud_darkness: f64,
+    /// Rain intensity, from 0.0 (dry) to 1.0 (heavy rain).
+    pub rain_intensity: f64,
+    /// Ambient temperature in Celsius.
+    pub ambient_temperature_celsius: f64,
+    /// Track temperature in Celsius.
+    pub track_temperature_celsius: f64,
+    /// Wind velocity in LMU world coordinates, in meters per second.
+    pub wind: Wind,
+    /// Lowest wetness on the racing path, from 0.0 (dry) to 1.0 (fully wet).
+    pub minimum_path_wetness: f64,
+    /// Highest wetness on the racing path, from 0.0 (dry) to 1.0 (fully wet).
+    pub maximum_path_wetness: f64,
+    /// Average wetness on the racing path, from 0.0 (dry) to 1.0 (fully wet).
+    pub average_path_wetness: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WeatherUpdate {
+    Snapshot(WeatherSnapshot),
+    NoSession,
+    Unchanged,
+}
+
+#[derive(Default)]
+struct WeatherState {
+    previous: Option<WeatherSnapshot>,
+    had_source: bool,
+}
+
+pub struct LmuWeather {
+    mapping: SharedMemory,
+    lock: SharedMemoryLock,
+    state: WeatherState,
+}
+
+impl LmuWeather {
+    pub fn connect() -> Result<Self> {
+        Ok(Self {
+            mapping: SharedMemory::open(MAPPING_NAME, MAPPING_SIZE)?,
+            lock: SharedMemoryLock::open()?,
+            state: WeatherState::default(),
+        })
+    }
+
+    pub fn read(&mut self) -> Result<WeatherUpdate> {
+        let Some(guard) = self.lock.try_lock() else {
+            let window: u64 = self.mapping.read(APPLICATION_WINDOW)?;
+            if !shared_memory::source_window_alive(window) {
+                self.state.had_source = false;
+                self.state.previous = None;
+                return Err(Error::SharedMemoryUnavailable {
+                    name: MAPPING_NAME.into(),
+                    source: "source stopped while the shared lock was busy".into(),
+                });
+            }
+            return Ok(WeatherUpdate::Unchanged);
+        };
+        let frame = read_weather_frame(&self.mapping)?;
+        drop(guard);
+        decode_weather(frame, &mut self.state)
+    }
+}
+
+struct RawWeatherFrame {
+    startup: u32,
+    shutdown: u32,
+    window: u64,
+    snapshot: WeatherSnapshot,
+}
+
+fn read_weather_frame<M: Memory + ?Sized>(memory: &M) -> Result<RawWeatherFrame> {
+    Ok(RawWeatherFrame {
+        startup: memory.read(STARTUP_EVENT)?,
+        shutdown: memory.read(SHUTDOWN_EVENT)?,
+        window: memory.read(APPLICATION_WINDOW)?,
+        snapshot: WeatherSnapshot {
+            cloud_darkness: memory.read(SCORING_CLOUD_DARKNESS)?,
+            rain_intensity: memory.read(SCORING_RAIN_INTENSITY)?,
+            ambient_temperature_celsius: memory.read(SCORING_AMBIENT_TEMPERATURE)?,
+            track_temperature_celsius: memory.read(SCORING_TRACK_TEMPERATURE)?,
+            wind: Wind {
+                x: memory.read(SCORING_WIND)?,
+                y: memory.read(SCORING_WIND + size_of::<f64>())?,
+                z: memory.read(SCORING_WIND + size_of::<f64>() * 2)?,
+            },
+            minimum_path_wetness: memory.read(SCORING_MIN_PATH_WETNESS)?,
+            maximum_path_wetness: memory.read(SCORING_MAX_PATH_WETNESS)?,
+            average_path_wetness: memory.read(SCORING_AVERAGE_PATH_WETNESS)?,
+        },
+    })
+}
+
+fn decode_weather(frame: RawWeatherFrame, state: &mut WeatherState) -> Result<WeatherUpdate> {
+    let source_stopped = !shared_memory::source_window_alive(frame.window)
+        || (frame.shutdown > 0 && frame.shutdown >= frame.startup);
+    if source_stopped {
+        let changed = state.had_source || state.previous.take().is_some();
+        state.had_source = false;
+        return Ok(if changed {
+            WeatherUpdate::NoSession
+        } else {
+            WeatherUpdate::Unchanged
+        });
+    }
+    let changed = !state.had_source || state.previous != Some(frame.snapshot);
+    state.had_source = true;
+    state.previous = Some(frame.snapshot);
+    Ok(if changed {
+        WeatherUpdate::Snapshot(frame.snapshot)
+    } else {
+        WeatherUpdate::Unchanged
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -939,6 +1031,45 @@ fn status(finish: u8, pit: u8, in_pits: bool, garage: bool) -> VehicleStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_f64(memory: &mut [u8], offset: usize, value: f64) {
+        memory[offset..offset + size_of::<f64>()].copy_from_slice(&value.to_ne_bytes());
+    }
+
+    #[test]
+    fn weather_snapshot_decodes_scoring_fields() {
+        let mut memory = vec![0; VEHICLE_SCORING];
+        write_f64(&mut memory, SCORING_CLOUD_DARKNESS, 0.25);
+        write_f64(&mut memory, SCORING_RAIN_INTENSITY, 0.5);
+        write_f64(&mut memory, SCORING_AMBIENT_TEMPERATURE, 21.5);
+        write_f64(&mut memory, SCORING_TRACK_TEMPERATURE, 29.25);
+        write_f64(&mut memory, SCORING_WIND, -2.0);
+        write_f64(&mut memory, SCORING_WIND + size_of::<f64>(), 0.5);
+        write_f64(&mut memory, SCORING_WIND + size_of::<f64>() * 2, 4.0);
+        write_f64(&mut memory, SCORING_MIN_PATH_WETNESS, 0.1);
+        write_f64(&mut memory, SCORING_MAX_PATH_WETNESS, 0.8);
+        write_f64(&mut memory, SCORING_AVERAGE_PATH_WETNESS, 0.4);
+
+        let frame = read_weather_frame(memory.as_slice()).unwrap();
+
+        assert_eq!(
+            frame.snapshot,
+            WeatherSnapshot {
+                cloud_darkness: 0.25,
+                rain_intensity: 0.5,
+                ambient_temperature_celsius: 21.5,
+                track_temperature_celsius: 29.25,
+                wind: Wind {
+                    x: -2.0,
+                    y: 0.5,
+                    z: 4.0,
+                },
+                minimum_path_wetness: 0.1,
+                maximum_path_wetness: 0.8,
+                average_path_wetness: 0.4,
+            }
+        );
+    }
 
     #[test]
     fn class_blocks_select_the_leader_and_focused_neighborhood() {

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 
-description = "Safe Rust reader for Le Mans Ultimate shared memory telemetry and standings"
+description = "Safe Rust reader for Le Mans Ultimate shared memory telemetry, weather, and standings"
 license = "MIT"
 
 documentation = "https://docs.rs/lmu-shared-memory"

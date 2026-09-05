@@ -15,9 +15,22 @@ match telemetry.read()? {
 # Ok::<(), lmu_shared_memory::Error>(())
 ```
 
+## Weather
+
+```rust,no_run
+use lmu_shared_memory::{LmuWeather, WeatherUpdate};
+
+let mut weather = LmuWeather::connect()?;
+if let WeatherUpdate::Snapshot(snapshot) = weather.read()? {
+    println!("track: {:.1} C", snapshot.track_temperature_celsius);
+    println!("rain: {:.0}%", snapshot.rain_intensity * 100.0);
+}
+# Ok::<(), lmu_shared_memory::Error>(())
+```
+
 ## Compatibility
 
-The packed offsets are based on LMU's `Support\SharedMemoryInterface` layout.
+The packed offsets are based on LMU's `Support\SharedMemoryInterface` layout. Weather is read from the scoring block in `LMU_Data`.
 
 ## License
 
